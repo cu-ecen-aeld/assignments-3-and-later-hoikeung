@@ -49,11 +49,11 @@ then
 	fi
 fi
 
-echo "Removing the old writer utility and compiling as a native application"
+#echo "Removing the old writer utility and compiling as a native application"
 #make CROSS_COMPILE=aarch64-none-linux-gnu- clean
 #make CROSS_COMPILE=aarch64-none-linux-gnu- all
-make clean
-make all
+#make clean
+#make all
 
 for i in $( seq 1 $NUMFILES)
 do
