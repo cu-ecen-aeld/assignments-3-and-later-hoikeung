@@ -1,4 +1,4 @@
-!# /bin/sh
+#!/bin/sh
 
 case "S1" in
   start)
