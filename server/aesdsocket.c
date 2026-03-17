@@ -34,30 +34,30 @@ void signal_handler(int signal)
 
 ssize_t write_file(const char* file_name, const char* str)
 {
+    ssize_t n = 0;
     FILE *file = fopen(file_name, "a+");
 
     if (file == NULL)
     {
-        printf("Cannot open write file, Error: %s", strerror(errno));
+        fprintf(stderr, "Cannot open write file, Error: %s\r\n", strerror(errno));
         fclose(file);
-        return 1;
+        exit_prog(1);
     }
     else
     {
-        ssize_t n = fwrite(str, strlen(str), 1, file);
+        n = fwrite(str, strlen(str), 1, file);
         if (n < 0)
         {
-            printf("Cannot write to file, Error: %s", strerror(errno));
+            fprintf(stderr, "Cannot write to file, Error: %s\r\n", strerror(errno));
             fclose(file);
-            return 1;
+            exit_prog(1);
         }
         else
         {
-            printf("Write file success, words = %s", str);
             fclose(file);
-            return n;
         }
     }
+    return n;
 }
 
 ssize_t read_file(const char* file_name, char* buffer, int length)
