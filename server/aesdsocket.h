@@ -10,6 +10,6 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 
-#define MAX_BUFFER_LEN  102400
+#define MAX_BUFFER_LEN  50000
 #define PORT            "9000"
 #define FILE_NAME       "/var/tmp/aesdsocketdata"
