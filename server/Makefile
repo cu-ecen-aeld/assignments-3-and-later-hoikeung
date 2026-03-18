@@ -16,4 +16,4 @@ $(TARGET) : $(OBJS)
 	$(CC) $(CFLAGS) $(INCLUDES) $(OBJS) -o $(TARGET) $(LDFLAGS)
 
 clean:
-	-rm -f *.o $(TARGET) *.elf *.map *.out
+	-rm -f *.o $(TARGET) *.elf *.map *.out aesdsocket
