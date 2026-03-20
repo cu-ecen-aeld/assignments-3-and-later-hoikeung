@@ -1,19 +1,13 @@
-CROSS_COMPILE ?= cc
-CFLAGS = -Wall -Werror
-SRC := aesdsocket.c
-TARGET = aesdsocket
-OBJS := $(SRC:.c=.o)
+CC ?= $(CROSS_COMPILE)gcc
+CFLAGS ?= -Wall -Werror -g
+LDFLAGS ?= -lpthread -lrt
+TARGET ?= aesdsocket
 
-ifeq ($(CROSS_COMPILE),aarch64-none-linux-gnu-)
-	CC = aarch64-none-linux-gnu-gcc
-else
-	CC = cc
-endif
-
+default: $(TARGET)
 all: $(TARGET)
 
-$(TARGET) : $(OBJS)
-	$(CC) $(CFLAGS) $(INCLUDES) $(OBJS) -o $(TARGET) $(LDFLAGS)
+$(TARGET): aesdsocket.c
+	$(CC) $(CFLAGS) $^ -o $@ $(INCLUDES) $(LDFLAGS)
 
 clean:
-	-rm -f *.o $(TARGET) *.elf *.map *.out aesdsocket
+	rm -f $(TARGET) *.o
