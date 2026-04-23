@@ -187,13 +187,14 @@ int main(int argc, char  *argv[])
         exit_prog(1);
     }
 
-    pthread_t timer_tid;
-    if (pthread_create(&timer_tid, NULL, timer_thread, NULL) != 0) 
-    {
-        syslog(LOG_ERR, "timer_thread create error: %s", strerror(errno));
-        fprintf(stderr, RED "timer_thread create error: %s\n" RESET, gai_strerror(status));
-        exit_prog(1);
-    }
+    // Timestamp
+    // pthread_t timer_tid;
+    // if (pthread_create(&timer_tid, NULL, timer_thread, NULL) != 0) 
+    // {
+    //     syslog(LOG_ERR, "timer_thread create error: %s", strerror(errno));
+    //     fprintf(stderr, RED "timer_thread create error: %s\n" RESET, gai_strerror(status));
+    //     exit_prog(1);
+    // }
 
     while (1)
     {

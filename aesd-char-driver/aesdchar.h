@@ -23,11 +23,26 @@
 #  define PDEBUG(fmt, args...) /* not debugging: nothing */
 #endif
 
+#define BUFFER_SIZE 10
+
+struct entry 
+{
+    char *ptr;
+    size_t size;
+};
+
 struct aesd_dev
 {
     /**
      * TODO: Add structure(s) and locks needed to complete assignment requirements
      */
+    struct mutex lock;
+    struct entry buffer[BUFFER_SIZE];
+    int count;
+    int write_pos;
+    struct entry entry_buffer;
+    int head;
+    
     struct cdev cdev;     /* Char device structure      */
 };
 

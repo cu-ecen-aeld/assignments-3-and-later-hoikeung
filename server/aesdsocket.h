@@ -15,7 +15,8 @@
 
 #define MAX_BUFFER_LEN  50000
 #define PORT            "9000"
-#define FILE_NAME       "/var/tmp/aesdsocketdata"
+//#define FILE_NAME       "/dev/aesdchar"
+#define FILE_NAME       "/var/tmp/aesdsocketdata" //Assignment 8
 #define TIMESTAMP_INTERVAL 10
 
 //Colour code for debug
