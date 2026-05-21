@@ -1,246 +1,297 @@
 #include "aesdsocket.h"
 
-static int socket_fd;
-int status;
-struct addrinfo hints;
-struct addrinfo *servinfo;
-
+static volatile sig_atomic_t exit_requested = 0;
 static pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
-static SLIST_HEAD(thread_list_head, thread_entry) thread_list;
+static int g_serverfd = -1;
 
-static void exit_prog(int e)
+SLIST_HEAD(thread_list_head, thread_node);
+static struct thread_list_head g_threads = SLIST_HEAD_INITIALIZER(g_threads);
+
+#if !USE_AESD_CHAR_DEVICE
+static pthread_t g_timestamp_thread;
+static bool g_timestamp_started = false;
+#endif
+
+/* Parse "AESDCHAR_IOCSEEKTO:X,Y" safely */
+static bool parse_ioctl_command(const char *buf, size_t len, struct aesd_seekto *seekto)
 {
-    freeaddrinfo(servinfo);
-    close(socket_fd);
-    closelog();
-    exit(e);
+    const char *prefix = "AESDCHAR_IOCSEEKTO:";
+    size_t prefix_len = strlen(prefix);
+
+    if (!buf || !seekto) return false;
+    if (len <= prefix_len) return false;
+    if (strncmp(buf, prefix, prefix_len) != 0) return false;
+
+    const char *start = buf + prefix_len;
+    const char *end = buf + len;
+    const char *comma = memchr(start, ',', (size_t)(end - start));
+    if (!comma) return false;
+
+    char *cmd_end = NULL;
+    char *off_end = NULL;
+
+    errno = 0;
+    unsigned long cmd = strtoul(start, &cmd_end, 10);
+    if (errno != 0 || cmd_end != comma) return false;
+
+    errno = 0;
+    unsigned long off = strtoul(comma + 1, &off_end, 10);
+    if (errno != 0) return false;
+
+    /* allow optional trailing newline */
+    if (!(off_end == end || (off_end + 1 == end && *off_end == '\n')))
+        return false;
+
+    /* prevent truncation when casting */
+    if (cmd > UINT32_MAX || off > UINT32_MAX)
+        return false;
+
+    seekto->write_cmd = (uint32_t)cmd;
+    seekto->write_cmd_offset = (uint32_t)off;
+
+    return true;
 }
 
-static void signal_handler(int signal) 
+/* send entire contents of fd to client */
+static int send_from_fd(int fd, int clientfd)
 {
-    if (signal == SIGINT || signal == SIGTERM) 
-    {
-        syslog(LOG_NOTICE, "Caught signal, exiting.");
-        remove(FILE_NAME);
-        // int removed = remove(FILE_NAME);
-        // if (removed == 0)
-        // {
-        //     printf("Removed success\n");
-        // }
-        // else
-        // {
-        //     printf("Removed fail\n");
-        // }
-        shutdown(socket_fd, SHUT_RDWR);
-    }
-    // printf("Exit\n");
-    exit_prog(0);
-}
+    char buffer[4096];
 
-ssize_t write_file(const char* file_name, const char* str)
-{
-    ssize_t n = 0;
-    FILE *file = fopen(file_name, "a+");
-
-    if (file == NULL)
-    {
-        fprintf(stderr, "Cannot open write file, Error: %s\n", strerror(errno));
-        fprintf(stderr, RED "Cannot open write file, Error: %s\n" RESET, gai_strerror(status));
-        fclose(file);
-        exit_prog(1);
-    }
-    else
-    {
-        n = fwrite(str, strlen(str), 1, file);
-        if (n < 0)
-        {
-            fprintf(stderr, RED "Cannot write to file, Error: %s\n" RESET, gai_strerror(status));
-            fclose(file);
-            exit_prog(1);
+    while (1) {
+        ssize_t r = read(fd, buffer, sizeof(buffer));
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return -1;
         }
-        else
-        {
-            fclose(file);
+        if (r == 0) break;
+
+        ssize_t sent = 0;
+        while (sent < r) {
+            ssize_t s = send(clientfd, buffer + sent, (size_t)(r - sent), 0);
+            if (s < 0) {
+                if (errno == EINTR) continue;
+                return -1;
+            }
+            sent += s;
         }
     }
-    return n;
+
+    return 0;
 }
 
-ssize_t read_file(const char* file_name, char* buffer, int length)
+static void signal_handler(int signo)
 {
-    FILE *file = fopen(file_name, "r");
-    ssize_t read_size = fread(buffer, 1, length, file);
-    fclose(file);
-    return read_size;
+    (void)signo;
+    exit_requested = 1;
 }
 
-static void *timer_thread(void *arg)
+static int setup_signals(void)
 {
-    struct timespec req;
-    req.tv_sec = TIMESTAMP_INTERVAL;
-    req.tv_nsec = 0;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = signal_handler;
 
-    while (1)
-    {
-        nanosleep(&req, NULL);
+    if (sigaction(SIGINT, &sa, NULL) != 0) return -1;
+    if (sigaction(SIGTERM, &sa, NULL) != 0) return -1;
 
-        time_t now = time(NULL);
-        struct tm *tm_p = localtime(&now);
-        char buf[128] = {0};
-        strftime(buf, sizeof(buf), "%a, %d %b %Y %H:%M:%S %z", tm_p);
-        buf[strlen(buf)] = '\n';
-
-        char timestmp[256] = "timestamp:";
-        strcat(timestmp, buf);
-
-        pthread_mutex_lock(&file_mutex);
-        write_file(FILE_NAME, timestmp);
-        pthread_mutex_unlock(&file_mutex);
-    }
-
-    return NULL;
+    return 0;
 }
 
-static void *connection_thread(void *arg)
+static int create_server_socket(void)
 {
-    struct thread_entry *entry = (struct thread_entry *) arg;
-
-    syslog(LOG_NOTICE, "Accepted connection from %s", entry->ip);
-
-    char recv_buf[MAX_BUFFER_LEN] = {0};
-    ssize_t buf_len = recv(entry->connection_fd, recv_buf, MAX_BUFFER_LEN, MSG_DONTWAIT); 
-    if (buf_len < 0)
-    {
-        fprintf(stderr, RED "Receive error: %s\n" RESET, gai_strerror(status));
-        exit_prog(1);
-    }
-    else if (recv_buf[buf_len-1] == '\n')
-    {
-        pthread_mutex_lock(&file_mutex);
-        write_file(FILE_NAME, recv_buf);
-        char send_buf[MAX_BUFFER_LEN] = {0};
-        ssize_t read_length = read_file(FILE_NAME, send_buf, MAX_BUFFER_LEN);
-        send(entry->connection_fd, send_buf, read_length, MSG_DONTWAIT);
-        pthread_mutex_unlock(&file_mutex);
-        syslog(LOG_NOTICE, "Closed connection from from %s", entry->ip);
-        entry->done = 1;
-    }
-
-    return NULL;
-}
-
-int main(int argc, char  *argv[])
-{
-    openlog("aesdsocket.c log", 0, LOG_USER);
-
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
-    
-    SLIST_INIT(&thread_list);
+    struct addrinfo hints, *res, *p;
+    int sockfd = -1;
 
     memset(&hints, 0, sizeof(hints));
-    hints.ai_flags = AI_PASSIVE;
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
 
-    status = getaddrinfo(NULL, PORT, &hints, &servinfo);
-    if (status != 0)
-    {
-        fprintf(stderr, RED "getaddrinfo error: %s\n" RESET, gai_strerror(status));
-        exit_prog(1);
+    if (getaddrinfo(NULL, PORT, &hints, &res) != 0)
+        return -1;
+
+    for (p = res; p; p = p->ai_next) {
+        int opt = 1;
+
+        sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (sockfd < 0) continue;
+
+        setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+        if (bind(sockfd, p->ai_addr, p->ai_addrlen) == 0)
+            break;
+
+        close(sockfd);
+        sockfd = -1;
     }
 
-    socket_fd = socket(servinfo->ai_family, servinfo->ai_socktype, servinfo->ai_protocol);
-    if (socket_fd == -1)
-    {
-        
-        exit_prog(1);
+    freeaddrinfo(res);
+
+    if (sockfd < 0) return -1;
+
+    if (listen(sockfd, BACKLOG) != 0) {
+        close(sockfd);
+        return -1;
     }
 
-    if (bind(socket_fd, servinfo->ai_addr, servinfo->ai_addrlen) != 0)
-    {
-        fprintf(stderr, RED "bind error: %s\n" RESET, gai_strerror(status));
-        exit_prog(1);
-    }
+    return sockfd;
+}
 
-    int daemon_mode = 0;
-    int opt;
-    while ((opt = getopt(argc, argv, "d")) != -1) 
-    {
-        if (opt == 'd') daemon_mode = 1;
-    }
-    if (daemon_mode) 
-    {
-        if (daemon_mode) 
-        {
-            if ((daemon(0, 0)) == -1) 
-            {
-                fprintf(stderr, RED "Failed to run in daemon mode.\n" RESET);
-                exit_prog(1);
-            }
+static int append_to_file(const char *buf, size_t len)
+{
+#if USE_AESD_CHAR_DEVICE
+    int fd = open(DATAFILE, O_WRONLY);  /* char device handles its own offsets */
+#else
+    int fd = open(DATAFILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
+#endif
+    if (fd < 0) return -1;
+
+    size_t written = 0;
+    while (written < len) {
+        ssize_t rc = write(fd, buf + written, len - written);
+        if (rc < 0) {
+            if (errno == EINTR) continue;
+            close(fd);
+            return -1;
         }
+        written += (size_t)rc;
     }
 
-    if (listen(socket_fd, 10) != 0)
-    {
-        fprintf(stderr, RED "listen error: %s\n" RESET, gai_strerror(status));
-        exit_prog(1);
-    }
+    close(fd);
+    return 0;
+}
 
-    // Timestamp
-    // pthread_t timer_tid;
-    // if (pthread_create(&timer_tid, NULL, timer_thread, NULL) != 0) 
-    // {
-    //     syslog(LOG_ERR, "timer_thread create error: %s", strerror(errno));
-    //     fprintf(stderr, RED "timer_thread create error: %s\n" RESET, gai_strerror(status));
-    //     exit_prog(1);
-    // }
+static int send_full_file(int clientfd)
+{
+    int fd = open(DATAFILE, O_RDONLY);
+    if (fd < 0) return -1;
 
-    while (1)
-    {
-        int connection_fd = -1;
-        struct sockaddr_in connection; 
-        socklen_t len = -1; 
-        len = sizeof(connection);
-        connection_fd = accept(socket_fd, (struct sockaddr *)&connection, &len);
-        if (connection_fd == -1)
-        {
-            fprintf(stderr, RED "accept error: %s\n" RESET, gai_strerror(status));
-            exit_prog(1);
-        }
-        else
-        {
-            // syslog(LOG_NOTICE, "Accepted connection from %s, fd = %d", inet_ntoa(connection.sin_addr), connection_fd);
+    lseek(fd, 0, SEEK_SET);
+    int rc = send_from_fd(fd, clientfd);
+    close(fd);
+    return rc;
+}
 
-            struct thread_entry *entry = malloc(sizeof(struct thread_entry));
-            entry->connection_fd = connection_fd;
-            entry->done = 0;
-            inet_ntop(AF_INET, &connection.sin_addr, entry->ip, sizeof(entry->ip));
+struct client_thread_args {
+    struct thread_node *node;
+    struct sockaddr_in client_addr;
+};
 
-            if (pthread_create(&entry->thread_id, NULL, connection_thread, entry) != 0) 
-            {
-                syslog(LOG_ERR, "connection_thread create error: %s", strerror(errno));
-                fprintf(stderr, RED "Fconnection_thread create error: %s\n" RESET, gai_strerror(status));
-                close(connection_fd);
-                free(entry);
-                exit_prog(1);
-            }
-            SLIST_INSERT_HEAD(&thread_list, entry, entries);
+static void *client_thread(void *arg)
+{
+    struct client_thread_args *args = arg;
+    struct thread_node *node = args->node;
+    int clientfd = node->clientfd;
 
-            struct thread_entry *e;
-            SLIST_FOREACH(e, &thread_list, entries)
-            {
-                if (e->done)
-                {
-                    pthread_join(e->thread_id, NULL);
-                    SLIST_REMOVE(&thread_list, e, thread_entry, entries);
-                    free(e);
+    char ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &args->client_addr.sin_addr, ip, sizeof(ip));
+    syslog(LOG_INFO, "Accepted connection from %s", ip);
+    free(args);
+
+    char *packet = NULL;
+    size_t packet_size = 0;
+
+    while (!exit_requested) {
+        char buf[1024];
+        ssize_t r = recv(clientfd, buf, sizeof(buf), 0);
+        if (r <= 0) break;
+
+        char *tmp = realloc(packet, packet_size + r);
+        if (!tmp) break;
+
+        packet = tmp;
+        memcpy(packet + packet_size, buf, r);
+        packet_size += r;
+
+        char *newline;
+        while ((newline = memchr(packet, '\n', packet_size))) {
+            size_t pkt_len = newline - packet + 1;
+
+            struct aesd_seekto seekto;
+            bool is_ioctl = parse_ioctl_command(packet, pkt_len, &seekto);
+
+            if (is_ioctl) {
+                pthread_mutex_lock(&file_mutex);
+
+                int devfd = open(DATAFILE, O_RDWR);
+                if (devfd >= 0) {
+                    /* ioctl changes file position inside driver */
+                    ioctl(devfd, AESDCHAR_IOCSEEKTO, &seekto);
+                    send_from_fd(devfd, clientfd);  /* read from that position */
+                    close(devfd);
                 }
+
+                pthread_mutex_unlock(&file_mutex);
+            } else {
+                pthread_mutex_lock(&file_mutex);
+                int wrc = append_to_file(packet, pkt_len);
+                int src = (wrc == 0) ? send_full_file(clientfd) : -1;
+                syslog(LOG_ERR, "normal path: pkt_len=%zu wrc=%d src=%d errno=%d", pkt_len, wrc, src, errno);
+                pthread_mutex_unlock(&file_mutex);
+
+                
             }
-            
+
+            memmove(packet, packet + pkt_len, packet_size - pkt_len);
+            packet_size -= pkt_len;
         }
     }
 
-    fprintf(stderr, RED "Final: %s\n" RESET, gai_strerror(status));
-    exit_prog(1);
+    free(packet);
+    shutdown(clientfd, SHUT_RDWR);
+    close(clientfd);
+    syslog(LOG_INFO, "Closed connection from %s", ip);
+
+    node->completed = true;
+    return NULL;
+}
+
+int main(int argc, char *argv[])
+{
+    bool daemon_mode = false;
+    if (argc == 2 && strcmp(argv[1], "-d") == 0)
+        daemon_mode = true;
+
+    openlog("aesdsocket", LOG_PID, LOG_USER);
+
+    setup_signals();
+
+    g_serverfd = create_server_socket();
+    if (g_serverfd < 0)
+        return -1;
+
+    /* standard daemonization: fork, detach, drop stdio */
+    if (daemon_mode) {
+        pid_t pid = fork();
+        if (pid < 0) return -1;
+        if (pid > 0) exit(0);
+
+        if (setsid() < 0) return -1;
+        if (chdir("/") != 0) return -1;
+
+        close(STDIN_FILENO);
+        close(STDOUT_FILENO);
+        close(STDERR_FILENO);
+    }
+
+    while (!exit_requested) {
+        struct sockaddr_in client_addr;
+        socklen_t addrlen = sizeof(client_addr);
+
+        int clientfd = accept(g_serverfd, (struct sockaddr *)&client_addr, &addrlen);
+        if (clientfd < 0) continue;
+
+        struct thread_node *node = calloc(1, sizeof(*node));
+        node->clientfd = clientfd;
+        SLIST_INSERT_HEAD(&g_threads, node, entries);
+
+        struct client_thread_args *args = malloc(sizeof(*args));
+        args->node = node;
+        args->client_addr = client_addr;
+
+        pthread_create(&node->thread, NULL, client_thread, args);
+    }
+
+    closelog();
+    return 0;
 }
